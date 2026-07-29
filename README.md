@@ -64,12 +64,13 @@ npx codex-security scan . --provider aether --dry-run
 #   source: AETHER_API_KEY
 ```
 
-**Choosing a model.** Pass any model id the endpoint serves via `--model`.
-The scan contract (multi-turn tool use, artifact generation, manifest
-completion) was built for frontier models: the protocol integration works
-across the full spectrum a gateway exposes (4B GGUF to 1.5TB MoE), but
-small models may explore correctly and still stop before completing the
-contract. Use the strongest model your endpoint serves for real scans.
+**Choosing a model.** Completing a scan requires a frontier-class model —
+Kimi K2.6, Qwen3.8-Max, GLM-5.x, or comparable. The multi-phase contract
+(sustained multi-turn tool use, artifact generation, manifest completion)
+is beyond smaller models: they will run the agentic loop correctly but
+typically stop before writing findings. `--model` accepts any model id the
+endpoint serves and `codex-security` will try whatever you pass — expect
+incomplete scans below frontier class.
 
 ### Standalone gateway
 

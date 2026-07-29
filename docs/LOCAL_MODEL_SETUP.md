@@ -23,7 +23,7 @@ codex-security scan . \
 
 `--provider` names the provider; `--base-url` + `--api-key-env` define it ad
 hoc, the same way opencode/pi register named providers. `--api-key-env` is
-the *name* of the environment variable holding the key, not the key itself.
+the _name_ of the environment variable holding the key, not the key itself.
 
 ## Using a provider from ~/.codex/config.toml
 
@@ -43,7 +43,7 @@ Then select it by name — no `--base-url` needed:
 codex-security scan . --provider aether --model local-llama
 ```
 
-Provider *selection* is never inherited from the ambient config; rerouting
+Provider _selection_ is never inherited from the ambient config; rerouting
 scans off OpenAI is always explicit (`--provider` or
 `--codex model_provider=...`). Explicit `--codex` provider blocks override
 ambient definitions of the same name.
@@ -67,12 +67,13 @@ Chat-only server.
 
 ## Model capability tiers
 
-The scan contract (multi-turn tool use, artifact generation, manifest
-completion) was built for frontier models. The gateway exposes everything
-from 4B GGUF to 1.5TB MoE; integration works across the spectrum, but scan
-*quality* is tier-dependent. Small models may explore correctly and still
-stop before completing the contract. Validate per tier; prefer the strongest
-model the endpoint serves for real scans.
+Completing a scan requires a frontier-class model — Kimi K2.6,
+Qwen3.8-Max, GLM-5.x, or comparable. The scan contract (sustained
+multi-turn tool use, artifact generation, manifest completion) is beyond
+smaller models: they run the agentic loop correctly but typically stop
+before writing findings. The gateway exposes everything from 4B GGUF to
+1.5TB MoE, and `codex-security` will try whatever model you pass — expect
+incomplete scans below frontier class.
 
 ## Limitations
 

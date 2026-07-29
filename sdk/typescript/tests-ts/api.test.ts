@@ -758,6 +758,99 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
+  test("runs custom-provider scans without OpenAI credentials", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    let selectedAuthentication: ScanAuthentication | undefined;
+    const client = new TestClient(
+      {
+        codexOverrides: {
+          model: "local-llama",
+          model_provider: "aether",
+          model_providers: {
+            aether: {
+              name: "aether",
+              base_url: "http://127.0.0.1:9/v1",
+              wire_api: "responses",
+            },
+          },
+        },
+      },
+      {
+        environment: {},
+        prepareRuntime: async () => ({
+          ...preparedRuntime(codexHome),
+          credentialsAvailable: false,
+          effectiveConfig: {
+            model: "local-llama",
+            model_reasoning_effort: "low",
+            model_provider: "aether",
+            model_providers: {
+              aether: {
+                name: "aether",
+                base_url: "http://127.0.0.1:9/v1",
+                wire_api: "responses",
+              },
+            },
+          },
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: () => {
+          throw new Error("custom provider scan reached");
+        },
+      },
+    );
+
+    await expect(
+      client.run(repository, {
+        onAuthentication: (authentication) => {
+          selectedAuthentication = authentication;
+        },
+      }),
+    ).rejects.toThrow("custom provider scan reached");
+    expect(selectedAuthentication).toEqual({
+      method: "model_provider",
+      provider: "aether",
+      source: null,
+      verified: false,
+    });
+    await client.close();
+  });
+
+  test("still requires OpenAI credentials when no custom provider is configured", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    const client = new TestClient(
+      {},
+      {
+        environment: {},
+        prepareRuntime: async () => ({
+          ...preparedRuntime(codexHome),
+          credentialsAvailable: false,
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        createCodex: () => {
+          throw new Error("scan should not reach the model");
+        },
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toBeInstanceOf(
+      AuthenticationRequiredError,
+    );
+    await client.close();
+  });
+
   test("removes ambient API keys from explicitly selected ChatGPT scans", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");

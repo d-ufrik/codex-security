@@ -1,10 +1,19 @@
 /// <reference lib="esnext.disposable" preserve="true" />
 
-import { chmod, lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { Codex, type CodexOptions } from "@openai/codex-sdk";
+import { parse as parseToml } from "smol-toml";
 import {
   accountStatus,
   CodexLoginHandle,
@@ -28,6 +37,7 @@ import {
 import {
   AuthenticationRequiredError,
   CodexSecurityError,
+  ConfigurationError,
   IncompleteScanError,
   OutputDirectoryError,
   OutputInsideProtectedRootError,
@@ -40,6 +50,10 @@ import {
   type PreparedKnowledgeBase,
 } from "./knowledge-base.js";
 import { ScanResult, type TurnResultMetadata } from "./result.js";
+import {
+  startResponsesShim,
+  type ResponsesShimHandle,
+} from "./responses-shim.js";
 import type { SeverityLevel } from "./models.js";
 import {
   workerStatusFromEvent,
@@ -109,6 +123,7 @@ interface PreparedRuntime {
   environment: Record<string, string>;
   credentialsAvailable: boolean;
   effectiveConfig?: JsonObject;
+  localGateway?: ResponsesShimHandle;
 }
 
 export interface ScanOptions {
@@ -147,6 +162,12 @@ export type ScanAuthentication =
     }
   | {
       method: "stored_credentials";
+      verified: false;
+    }
+  | {
+      method: "model_provider";
+      provider: string;
+      source: string | null;
       verified: false;
     };
 
@@ -280,6 +301,7 @@ export class CodexSecurity {
       authentication: scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        configuration,
       ),
       ...model,
       ...(options.maxCostUsd === undefined
@@ -351,6 +373,7 @@ export class CodexSecurity {
       const authentication = scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        await mergedCodexConfig(this.config),
       );
       const scanEnvironment = selectedScanEnvironment(
         this.#dependencies.environment,
@@ -409,7 +432,10 @@ export class CodexSecurity {
         runtime.credentialsAvailable = true;
         this.#runtimeCredentialSource = "api_key";
       }
-      if (!runtime.credentialsAvailable) {
+      if (
+        !runtime.credentialsAvailable &&
+        authentication.method !== "model_provider"
+      ) {
         throw new AuthenticationRequiredError(
           "No credentials were found. Run 'codex-security login', use " +
             "'codex-security login --device-auth' on a remote or headless machine, or set " +
@@ -876,11 +902,14 @@ export class CodexSecurity {
     this.#runtime = null;
     this.#runtimePromise = null;
     if (runtime !== null && runtime !== undefined) {
-      const cleanupResults = await Promise.allSettled(
-        [runtime.codexHome, runtime.bootstrapWorkspace]
+      const cleanupResults = await Promise.allSettled([
+        ...[runtime.codexHome, runtime.bootstrapWorkspace]
           .filter((path): path is string => path !== undefined)
           .map((path) => cleanupSdkDirectory(path)),
-      );
+        ...(runtime.localGateway === undefined
+          ? []
+          : [runtime.localGateway.close()]),
+      ]);
       for (const result of cleanupResults) {
         if (result.status === "rejected") throw result.reason;
       }
@@ -1017,6 +1046,7 @@ export class CodexSecurity {
     }
     const codexHome = await createIsolatedHome(temporaryRoot, validateLocation);
     let bootstrapWorkspace: string | undefined;
+    let gateway: ResponsesShimHandle | null = null;
     try {
       throwIfAborted(signal);
       bootstrapWorkspace = await createIsolatedHome(
@@ -1039,26 +1069,36 @@ export class CodexSecurity {
       );
       const ambientHome = configuredAmbientHome ?? nodeAmbientHome;
       const mergedConfig = await mergedCodexConfig(this.config);
-      const codexConfig = scanRuntimeCodexConfig(
+      const withAmbientProviders = mergeAmbientModelProviders(
         mergedConfig,
+        await ambientModelProviders(ambientHome),
+      );
+      const { config: effectiveMerged, gateway: preparedGateway } =
+        await prepareLocalGateway(withAmbientProviders, processEnvironment);
+      gateway = preparedGateway;
+      const codexConfig = scanRuntimeCodexConfig(
+        effectiveMerged,
         codexSecurityStateDirectory(processEnvironment),
       );
       await writeCodexConfig(join(codexHome, "config.toml"), codexConfig);
       const configPath = join(bootstrapWorkspace, "config-preflight.toml");
       await writeCodexConfig(
         configPath,
-        scanPreflightCodexConfig(mergedConfig),
+        scanPreflightCodexConfig(effectiveMerged),
       );
       throwIfAborted(signal);
       const plugin = await bootstrapPlugin(codexHome, pluginRoot, {
         environment: withoutCodexHome(processEnvironment),
         signal,
       });
-      const credentialsAvailable = await initialCredentialsAvailable(
-        processEnvironment,
-        ambientHome,
-        codexHome,
-      );
+      const credentialsAvailable =
+        gateway === null
+          ? await initialCredentialsAvailable(
+              processEnvironment,
+              ambientHome,
+              codexHome,
+            )
+          : false;
       return {
         codexHome,
         bootstrapWorkspace,
@@ -1071,14 +1111,16 @@ export class CodexSecurity {
             codexSecurityStateDirectory(processEnvironment),
         },
         credentialsAvailable,
-        effectiveConfig: mergedConfig,
+        effectiveConfig: effectiveMerged,
+        localGateway: gateway ?? undefined,
       };
     } catch (error) {
-      const cleanupResults = await Promise.allSettled(
-        [bootstrapWorkspace, codexHome]
+      const cleanupResults = await Promise.allSettled([
+        ...[bootstrapWorkspace, codexHome]
           .filter((path): path is string => path !== undefined)
           .map((path) => cleanupSdkDirectory(path)),
-      );
+        ...(gateway === null ? [] : [gateway.close()]),
+      ]);
       const cleanupFailures = cleanupResults.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
       );
@@ -1439,7 +1481,19 @@ async function collectResult(
 export function scanAuthentication(
   environment: ProcessEnvironment,
   auth: ScanAuthMode = "auto",
+  config?: Readonly<JsonObject>,
 ): ScanAuthentication {
+  if (config !== undefined) {
+    const provider = customProviderName(config);
+    if (provider !== null) {
+      return {
+        method: "model_provider",
+        provider,
+        source: modelProviderEnvKey(config, provider),
+        verified: false,
+      };
+    }
+  }
   if (auth === "chatgpt") {
     return { method: "stored_credentials", verified: false };
   }
@@ -1453,6 +1507,167 @@ export function scanAuthentication(
   return key === null
     ? { method: "stored_credentials", verified: false }
     : { method: "api_key", source: key.source, verified: false };
+}
+
+const OPENAI_MODEL_PROVIDER = "openai";
+
+/**
+ * Returns the configured model provider when it is a custom (non-OpenAI)
+ * provider, or null when scans should use the default OpenAI endpoint.
+ */
+export function customProviderName(
+  config: Readonly<JsonObject>,
+): string | null {
+  const provider = config["model_provider"];
+  if (typeof provider !== "string" || provider.trim() === "") return null;
+  if (provider === OPENAI_MODEL_PROVIDER) return null;
+  return provider;
+}
+
+function modelProviderBlock(
+  config: Readonly<JsonObject>,
+  provider: string,
+): JsonObject | null {
+  const providers = config["model_providers"];
+  if (
+    typeof providers !== "object" ||
+    providers === null ||
+    Array.isArray(providers)
+  ) {
+    return null;
+  }
+  const block = providers[provider];
+  if (typeof block !== "object" || block === null || Array.isArray(block)) {
+    return null;
+  }
+  return block;
+}
+
+function modelProviderEnvKey(
+  config: Readonly<JsonObject>,
+  provider: string,
+): string | null {
+  const envKey = modelProviderBlock(config, provider)?.["env_key"];
+  return typeof envKey === "string" && envKey.trim() !== "" ? envKey : null;
+}
+
+/**
+ * Reads only the `model_providers` table from the ambient Codex
+ * configuration (usually ~/.codex/config.toml) so provider definitions
+ * carry over into the isolated scan runtime. Provider *selection*
+ * (`model_provider`) is intentionally not inherited: rerouting scans away
+ * from OpenAI must be an explicit choice. A missing or unparsable ambient
+ * config yields null.
+ */
+export async function ambientModelProviders(
+  ambientHome: string,
+): Promise<JsonObject | null> {
+  let contents: string;
+  try {
+    contents = await readFile(join(ambientHome, "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseToml(contents);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const providers = (parsed as Record<string, unknown>)["model_providers"];
+  if (
+    typeof providers !== "object" ||
+    providers === null ||
+    Array.isArray(providers)
+  ) {
+    return null;
+  }
+  const result: JsonObject = {};
+  for (const [name, block] of Object.entries(
+    providers as Record<string, unknown>,
+  )) {
+    if (typeof block === "object" && block !== null && !Array.isArray(block)) {
+      result[name] = structuredClone(block) as JsonObject;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+export function mergeAmbientModelProviders(
+  config: JsonObject,
+  ambient: JsonObject | null,
+): JsonObject {
+  if (ambient === null) return config;
+  const merged = structuredClone(config);
+  const existing = merged["model_providers"];
+  const providers: JsonObject = structuredClone(ambient);
+  if (
+    typeof existing === "object" &&
+    existing !== null &&
+    !Array.isArray(existing)
+  ) {
+    for (const [name, block] of Object.entries(existing)) {
+      providers[name] = block;
+    }
+  }
+  merged["model_providers"] = providers;
+  return merged;
+}
+
+/**
+ * When a custom model provider is selected, starts the local
+ * Responses-to-Chat gateway in front of the provider's base URL and
+ * rewrites the configuration so the Codex CLI talks to the gateway.
+ * Chat Completions is the only wire API served by OpenAI-compatible
+ * servers such as Aether Desktop, llama-server, ollama, and vLLM, while
+ * the bundled Codex CLI requires the Responses API for custom providers.
+ */
+export async function prepareLocalGateway(
+  config: JsonObject,
+  environment: ProcessEnvironment,
+): Promise<{ config: JsonObject; gateway: ResponsesShimHandle | null }> {
+  const provider = customProviderName(config);
+  if (provider === null) return { config, gateway: null };
+  const block = modelProviderBlock(config, provider);
+  if (block === null) {
+    throw new ConfigurationError(
+      `The model provider "${provider}" is not defined. Pass --base-url, ` +
+        `add --codex 'model_providers.${provider}.base_url="..."', or define ` +
+        `[model_providers.${provider}] in ~/.codex/config.toml.`,
+    );
+  }
+  const baseUrl = block["base_url"];
+  if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
+    throw new ConfigurationError(
+      `The model provider "${provider}" is missing base_url.`,
+    );
+  }
+  const envKey = modelProviderEnvKey(config, provider);
+  let upstreamApiKey: string | undefined;
+  if (envKey !== null) {
+    const value = environmentValue(environment, envKey);
+    if (value === undefined || value.trim() === "") {
+      throw new ConfigurationError(
+        `The model provider "${provider}" authenticates with the ${envKey} ` +
+          `environment variable, but ${envKey} is not set.`,
+      );
+    }
+    upstreamApiKey = value.trim();
+  }
+  const gateway = await startResponsesShim({
+    upstreamBaseUrl: baseUrl.trim(),
+    upstreamApiKey,
+  });
+  const rewritten = structuredClone(config);
+  const providers = rewritten["model_providers"] as JsonObject;
+  const rewrittenBlock = structuredClone(block);
+  rewrittenBlock["base_url"] = gateway.baseUrl;
+  rewrittenBlock["wire_api"] = "responses";
+  providers[provider] = rewrittenBlock;
+  return { config: rewritten, gateway };
 }
 
 function selectedScanEnvironment(

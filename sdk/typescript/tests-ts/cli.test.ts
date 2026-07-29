@@ -30,7 +30,12 @@ import {
   ScanInterruptedError,
   VERSION,
 } from "../src/index.js";
-import { main, parseCodexOverrides, Progress } from "../src/cli.js";
+import {
+  applyProviderArguments,
+  main,
+  parseCodexOverrides,
+  Progress,
+} from "../src/cli.js";
 import {
   FakeSignals,
   REDACTED_CREDENTIALS,
@@ -1383,6 +1388,94 @@ describe("CLI", () => {
     expect(() =>
       parseCodexOverrides(['model="gpt-5.6-sol"'], "gpt-5.6-terra"),
     ).toThrow("--model conflicts with --codex model");
+  });
+
+  test("folds provider flags into Codex overrides like named providers", () => {
+    expect(
+      applyProviderArguments(
+        {},
+        {
+          provider: "aether",
+          baseUrl: "http://127.0.0.1:8183/v1",
+          apiKeyEnv: "AETHER_API_KEY",
+        },
+      ),
+    ).toEqual({
+      model_provider: "aether",
+      model_providers: {
+        aether: {
+          name: "aether",
+          base_url: "http://127.0.0.1:8183/v1",
+          wire_api: "responses",
+          env_key: "AETHER_API_KEY",
+        },
+      },
+    });
+    // Provider selection without an ad hoc definition: the provider block
+    // comes from --codex overrides or the ambient ~/.codex/config.toml.
+    expect(applyProviderArguments({}, { provider: "aether" })).toEqual({
+      model_provider: "aether",
+    });
+    expect(applyProviderArguments({ model: "m" }, {})).toEqual({ model: "m" });
+    expect(() =>
+      applyProviderArguments({ model_provider: "x" }, { provider: "aether" }),
+    ).toThrow("--provider conflicts with --codex model_provider");
+    expect(() => applyProviderArguments({}, { provider: "  " })).toThrow(
+      "--provider must not be empty",
+    );
+  });
+
+  test("routes scans through a named local model provider", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    let config: CodexSecurityConfig | undefined;
+    expect(
+      await main(
+        [
+          "scan",
+          "repo",
+          "--provider",
+          "aether",
+          "--base-url",
+          "http://127.0.0.1:8183/v1",
+          "--api-key-env",
+          "AETHER_API_KEY",
+          "--model",
+          "local-llama",
+        ],
+        stdout.stream,
+        stderr.stream,
+        dependencies({ onConfig: (value) => (config = value) }),
+      ),
+    ).toBe(0);
+    expect(config?.codexOverrides).toEqual({
+      model: "local-llama",
+      model_provider: "aether",
+      model_providers: {
+        aether: {
+          name: "aether",
+          base_url: "http://127.0.0.1:8183/v1",
+          wire_api: "responses",
+          env_key: "AETHER_API_KEY",
+        },
+      },
+    });
+  });
+
+  test("requires --provider for --base-url and --api-key-env", async () => {
+    for (const argv of [
+      ["scan", "repo", "--base-url", "http://127.0.0.1:8183/v1"],
+      ["scan", "repo", "--api-key-env", "AETHER_API_KEY"],
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await main(argv, stdout.stream, stderr.stream, dependencies()),
+      ).toBe(2);
+      expect(stripVTControlCharacters(stderr.text())).toContain(
+        "--base-url and --api-key-env require --provider",
+      );
+    }
   });
 
   test("redacts malformed and bounded --codex overrides", () => {

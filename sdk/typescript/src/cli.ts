@@ -37,6 +37,7 @@ import {
   type ScanPreflight,
 } from "./api.js";
 import { accountStatus } from "./auth.js";
+import { startResponsesShim } from "./responses-shim.js";
 import {
   createBulkScanDiscoveryDependencies,
   runBulkScanWizard,
@@ -140,6 +141,11 @@ const VALUE_OPTIONS = new Set([
   "--plugin-path",
   "--python",
   "--codex",
+  "--provider",
+  "--base-url",
+  "--api-key-env",
+  "--upstream",
+  "--port",
   "--fail-on-severity",
   "--max-cost",
   "--workers",
@@ -176,6 +182,9 @@ interface ScanArguments {
   pythonPath?: string;
   codex: string[];
   codexOverrides?: JsonObject;
+  provider?: string;
+  baseUrl?: string;
+  apiKeyEnv?: string;
   failOnSeverity?: FailureSeverity;
   maxCostUsd?: number;
   dryRun: boolean;
@@ -908,6 +917,21 @@ export async function main(
             .describe(
               "Override isolated Codex config with KEY=VALUE; repeat as needed.",
             ),
+          provider: optionValue("--provider")
+            .optional()
+            .describe(
+              "Route the scan through a named model provider, e.g. an Aether Desktop gateway.",
+            ),
+          baseUrl: optionValue("--base-url")
+            .optional()
+            .describe(
+              "Provider base URL (with --provider); defines the provider ad hoc.",
+            ),
+          apiKeyEnv: optionValue("--api-key-env")
+            .optional()
+            .describe(
+              "Environment variable holding the provider API key (with --provider).",
+            ),
           failOnSeverity: z
             .enum(REPORTABLE_SEVERITIES)
             .optional()
@@ -947,10 +971,25 @@ export async function main(
           (options) =>
             !options.archiveExisting || options.outputDir !== undefined,
           { message: "--archive-existing requires --output-dir." },
+        )
+        .refine(
+          (options) =>
+            options.provider !== undefined ||
+            (options.baseUrl === undefined && options.apiKeyEnv === undefined),
+          { message: "--base-url and --api-key-env require --provider." },
         ),
       examples: [
         { args: { repository: "." } },
         { args: { repository: "." }, options: { model: "gpt-5.6-terra" } },
+        {
+          args: { repository: "." },
+          options: {
+            provider: "aether",
+            baseUrl: "http://127.0.0.1:8183/v1",
+            apiKeyEnv: "AETHER_API_KEY",
+            model: "local-llama",
+          },
+        },
         { args: { repository: "." }, options: { path: ["src", "tests"] } },
         { args: { repository: "." }, options: { diff: "origin/main" } },
       ],
@@ -980,6 +1019,9 @@ export async function main(
             pluginPath: options.pluginPath,
             pythonPath: options.python,
             codex: options.codex,
+            provider: options.provider,
+            baseUrl: options.baseUrl,
+            apiKeyEnv: options.apiKeyEnv,
             failOnSeverity: options.failOnSeverity,
             maxCostUsd: options.maxCost,
             dryRun: options.dryRun,
@@ -1066,6 +1108,69 @@ export async function main(
           exitCode = 2;
           return undefined;
         }
+      },
+    })
+    .command("serve-local", {
+      description:
+        "Run the local Responses-to-Chat model gateway (debugging aid).",
+      destructive: false,
+      mcp: false,
+      args: z.object({}),
+      options: z.object({
+        upstream: optionValue("--upstream").describe(
+          "Chat Completions base URL to forward to, e.g. http://127.0.0.1:8183/v1.",
+        ),
+        port: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Loopback port to listen on (default: ephemeral)."),
+        apiKeyEnv: optionValue("--api-key-env")
+          .optional()
+          .describe("Environment variable holding the upstream API key."),
+      }),
+      output: z.object({ baseUrl: z.string(), port: z.number() }).optional(),
+      async run({ options }) {
+        let upstreamApiKey: string | undefined;
+        if (options.apiKeyEnv !== undefined) {
+          const value = dependencies.environment[options.apiKeyEnv]?.trim();
+          if (value === undefined || value === "") {
+            errorOutput.write(
+              `codex-security: ${options.apiKeyEnv} is not set.\n`,
+            );
+            exitCode = 2;
+            return undefined;
+          }
+          upstreamApiKey = value;
+        }
+        let shim;
+        try {
+          shim = await startResponsesShim({
+            upstreamBaseUrl: options.upstream,
+            upstreamApiKey,
+            port: options.port,
+          });
+        } catch (error) {
+          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          exitCode = 2;
+          return undefined;
+        }
+        errorOutput.write(
+          `Local model gateway listening on ${shim.baseUrl} -> ${options.upstream}\n` +
+            'Configure it as a Codex provider base_url with wire_api = "responses". Press Ctrl-C to stop.\n',
+        );
+        await new Promise<void>((resolve) => {
+          const stop = (): void => {
+            dependencies.removeSignalListener("SIGINT", stop);
+            dependencies.removeSignalListener("SIGTERM", stop);
+            resolve();
+          };
+          dependencies.addSignalListener("SIGINT", stop);
+          dependencies.addSignalListener("SIGTERM", stop);
+        });
+        await shim.close();
+        return { baseUrl: shim.baseUrl, port: shim.port };
       },
     })
     .command(scanHistory)
@@ -2246,9 +2351,11 @@ async function runScan(
     const config: CodexSecurityConfig = {
       pluginPath: arguments_.pluginPath,
       pythonPath: arguments_.pythonPath,
-      codexOverrides:
+      codexOverrides: applyProviderArguments(
         arguments_.codexOverrides ??
-        parseCodexOverrides(arguments_.codex, arguments_.model),
+          parseCodexOverrides(arguments_.codex, arguments_.model),
+        arguments_,
+      ),
     };
     let auth = arguments_.auth;
     selectedAuthentication = scanAuthentication(dependencies.environment, auth);
@@ -2339,6 +2446,13 @@ async function runScan(
           );
           progress?.stage(
             "To use your ChatGPT sign-in, retry with --auth chatgpt.",
+          );
+        } else if (authentication.method === "model_provider") {
+          progress?.stage(
+            `Authentication: model provider "${authentication.provider}"` +
+              (authentication.source === null
+                ? " (no API key configured)."
+                : ` (key from ${authentication.source}).`),
           );
         } else {
           progress?.stage("Authentication: stored Codex credentials.");
@@ -2481,6 +2595,14 @@ function scanFailureMessage(
 ): string {
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
+      if (authentication?.method === "model_provider") {
+        return (
+          `Authentication failed with model provider "${authentication.provider}". ` +
+          (authentication.source === null
+            ? "The provider has no env_key configured; check the endpoint's base_url."
+            : `Check the API key in ${authentication.source}.`)
+        );
+      }
       return authentication?.method === "api_key"
         ? `Authentication failed using ${authentication.source}. ` +
             "Your ChatGPT sign-in was not used. " +
@@ -2488,6 +2610,12 @@ function scanFailureMessage(
         : "Authentication failed using stored ChatGPT credentials. " +
             "Sign in again with 'codex-security login' or provide a valid API key.";
     case "forbidden":
+      if (authentication?.method === "model_provider") {
+        return (
+          `The model provider "${authentication.provider}" rejected the configured model or key. ` +
+          "Check the model id and provider configuration."
+        );
+      }
       return authentication?.method === "api_key"
         ? `The API key from ${authentication.source} cannot access the configured model. ` +
             "Retry with '--auth chatgpt' or use an API key with model access."
@@ -2752,6 +2880,58 @@ export function parseCodexOverrides(
       );
     }
     cursor[final] = parsed;
+  }
+  return result;
+}
+
+/**
+ * Folds the --provider/--base-url/--api-key-env scan flags into the Codex
+ * config overrides as a `model_provider` selection plus a
+ * `model_providers.<name>` definition, mirroring how opencode and pi
+ * register named providers (base URL + API-key environment variable).
+ */
+export function applyProviderArguments(
+  overrides: JsonObject,
+  arguments_: {
+    provider?: string;
+    baseUrl?: string;
+    apiKeyEnv?: string;
+  },
+): JsonObject {
+  if (arguments_.provider === undefined) return overrides;
+  const provider = arguments_.provider.trim();
+  if (provider === "") {
+    throw new CodexSecurityError("--provider must not be empty.");
+  }
+  if ("model_provider" in overrides) {
+    throw new CodexSecurityError(
+      "--provider conflicts with --codex model_provider.",
+    );
+  }
+  const result = structuredClone(overrides);
+  result["model_provider"] = provider;
+  if (arguments_.baseUrl !== undefined) {
+    const providersValue = result["model_providers"];
+    const providers: JsonObject =
+      providersValue !== undefined && isJsonObject(providersValue)
+        ? providersValue
+        : {};
+    const existingValue = providers[provider];
+    const existing: JsonObject =
+      existingValue !== undefined && isJsonObject(existingValue)
+        ? existingValue
+        : {};
+    const block: JsonObject = {
+      ...existing,
+      name: provider,
+      base_url: arguments_.baseUrl,
+      wire_api: "responses",
+    };
+    if (arguments_.apiKeyEnv !== undefined) {
+      block["env_key"] = arguments_.apiKeyEnv;
+    }
+    providers[provider] = block;
+    result["model_providers"] = providers;
   }
   return result;
 }
